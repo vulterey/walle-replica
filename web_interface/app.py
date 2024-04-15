@@ -1,16 +1,25 @@
 #############################################
 # Wall-e Robot Web-interface
 #
-# @file       app.py
-# @brief      Flask web-interface to control Wall-e robot
-# @author     Simon Bluett
-# @website    https://wired.chillibasket.com
-# @copyright  Copyright (C) 2021 - Distributed under MIT license
-# @version    1.5
-# @date       31st October 2021
+# @file       	app.py
+# @brief      	Flask web-interface to control Wall-e robot
+# @author     	Simon Bluett
+# @website    	https://wired.chillibasket.com
+# @copyright  	Copyright (C) 2021 - Distributed under MIT license
+# @version    	1.5.1
+# @date       	31st October 2021
 #############################################
 
-from flask import Flask, request, session, redirect, url_for, jsonify, render_template
+# @modified by vulterey 
+# @date of mod 15th April 2024
+
+# added functionality: 
+# - new version Raspbery Pi OS (bookworm) video streaming with Picamera2 (with the new streaming_server.py file)
+# - status LED/low battery LED functionality
+# - rec, play, stop and 'sun' tactile buttons handling
+#############################################
+
+from flask import Flask, request, session, redirect, url_for, jsonify, render_template, current_app
 import queue 		# for serial command queue
 import threading 	# for multiple threads
 import os
@@ -19,19 +28,23 @@ import serial 		# for Arduino serial access
 import serial.tools.list_ports
 import subprocess 	# for shell commands
 import time
+import RPi.GPIO as GPIO
 app = Flask(__name__)
-
+from gpiozero import PWMLED # for status/battery LED
+from gpiozero import Button # for buttons handling
 
 ##### VARIABLES WHICH YOU CAN MODIFY #####
-loginPassword = "put_password_here"                                  # Password for web-interface
-arduinoPort = "ARDUINO"                                              # Default port which will be selected
-streamScript = "/home/pi/mjpg-streamer.sh"                           # Location of script used to start/stop video stream
-soundFolder = "/home/pi/walle-replica/web_interface/static/sounds/"  # Location of the folder containing all audio files
-app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24)      # Secret key used for login session cookies
-autoStartArduino = False                                             # False = no auto connect, True = automatically try to connect to default port
-autoStartCamera = False                                              # False = no auto start, True = automatically start up the camera
+loginPassword = "put_password_here"                                            	# Password for web-interface
+arduinoPort = "ARDUINO"                                                         # Default port which will be selected. Replace the text ARDUINO with the name of your device.
+                                                                                # The name must match the one which appears in the drop-down menu in the “Settings” tab of the web-interface.
+streamScript = "/home/pi/walle-replica/web_interface/streaming_server.py"       # Location of script used to start/stop video stream
+soundFolder = "/home/pi/walle-replica/web_interface/static/sounds/"             # Location of the folder containing all audio files
+app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24)      	        # Secret key used for login session cookies
+autoStartArduino = False                                              	        # False = no auto connect, True = automatically try to connect to default port
+autoStartCamera = False                                            	            # False = no auto start, True = automatically start up the camera
+enableLED = False                                                               # False = LED functionality off, True = LED fuctionality on
+enableButtons = False                                                           # False = Rec, Play, Stop and 'Sun' buttons functionality off, True = Rec, Play, Stop and 'Sun' buttons functionality on
 ##########################################
-
 
 # Start sound mixer
 pygame.mixer.init()
@@ -46,7 +59,6 @@ queueLock = threading.Lock()
 workQueue = queue.Queue()
 threads = []
 initialStartup = False
-
 
 #############################################
 # Set up the multithreading stuff here
@@ -130,6 +142,78 @@ def process_data(threadName, q, port):
 	ser.close()
 
 
+#############################################
+# Set up the power LED
+# The LED is lit when the app.py runs
+# except when battery is below safe level
+# then the LED start pulsing
+# It goes off once the app.py is closed
+#############################################
+# Power on LED code
+
+if enableLED:
+    led = PWMLED(20) # (20) is the GPIO/BCM pin number of the Raspberry Pi - replace it with the pin you plugged in your LED
+    led.value = 0.1 # 0-10 brightness set from 0 to 1 to control brightness	
+#############################################
+
+#############################################
+# Physical buttons
+# Added 4 tactile buttons to WALL-E 
+# Rec, Play and Stop are responsible for calling a function
+# "Sun" button I made Power-Off button for Raspbery Pi
+# You can make a shutdown button without the need for a running script by adding this to /boot/firmware/config.txt:
+#
+#dtoverlay=gpio-shutdown
+#The default pin for the above is pin 5 (GPIO3).
+#
+#If you plan to use I2C then you will need to change the shutdown pin to something else.
+#For example to change the shutdown pin from the default GPIO 3 to GPIO 21 (physical pin 40), add this to /boot/firmware/config.txt
+#
+#dtoverlay=gpio-shutdown
+#dtoverlay=gpio-shutdown,gpio_pin=21
+#############################################
+# Buttons handler
+# If you want to use this function uncomment the lines from 179-210.
+# Currently the buttons are mapped to play sounds hardcoded below in lines: recBtn.when_pressed, playBtn.when_pressed and stopBtn.when_pressed.
+# You can replace sound names with your own.
+
+if enableButtons:
+    # GPIO setup
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+
+    # Initialize last pressed time for each button
+    last_pressed_time_rec = 0
+    last_pressed_time_play = 0
+    last_pressed_time_stop = 0
+
+    # Setup buttons
+    recBtn = Button(19, pull_up=True)
+    playBtn = Button(13, pull_up=True)
+    stopBtn = Button(16, pull_up=True)
+
+    def button_pressed(button, last_pressed_time, sound):
+        global last_pressed_time_rec, last_pressed_time_play, last_pressed_time_stop
+        current_time = time.time()
+        # Check if the time difference since the last press is greater than 0.5 seconds
+        if current_time - last_pressed_time > 0.5:
+            print(f"{button} button pressed")
+            last_pressed_time = current_time
+            playSound(sound)
+
+    recBtn.when_pressed = lambda: button_pressed('Rec', last_pressed_time_rec, 'Voice_Walle-1_1950')
+    playBtn.when_pressed = lambda: button_pressed('Play', last_pressed_time_play, 'Voice_Walle-2_3900')
+    stopBtn.when_pressed = lambda: button_pressed('Stop', last_pressed_time_stop, 'Voice_Walle-3_1700')
+
+    def playSound(sound):
+        clip = soundFolder + sound + ".ogg"
+        pygame.mixer.music.load(clip)
+        pygame.mixer.music.set_volume(volume/10.0)
+        pygame.mixer.music.play()
+        print("Play music clip:", clip)
+
+#############################################
+
 ##
 # Parse messages received from the Arduino
 #
@@ -143,7 +227,11 @@ def parseArduinoMessage(dataString):
 		dataList = dataString.split('_')
 		if len(dataList) > 1 and dataList[1].isdigit():
 			batteryLevel = dataList[1]
-
+			# ####################################################
+			# Start pulsing LED if battery level drops below 49
+			if enableLED and batteryLevel < "50":
+			    led.pulse()
+			# ####################################################
 
 ##
 # Turn on/off the Arduino background communications thread
@@ -193,6 +281,8 @@ def onoff_arduino(q, portNum):
 	return 0
 
 
+
+
 ##
 # Test whether the Arduino connection is still active
 #
@@ -212,35 +302,25 @@ def test_arduino():
 ##
 # Turn on/off the webcam MJPG Streamer
 #
+#####################################################################################################################################
+
 def onoff_streamer():
-	global streaming
-	
-	if not streaming:
-		# Turn on stream
-		subprocess.call([streamScript, 'start'], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-		result = ""
+    global streaming
+    
+    if not streaming:
+        # Turn on stream
+        subprocess.Popen(["python3", streamScript], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("Camera stream: STARTED")
+        streaming = 1
+        return 0
+    else:
+        # Turn off stream
+        subprocess.Popen(["pkill", "-f", "streaming_server.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("Camera stream: STOPPED")
+        streaming = 0
+        return 0
 
-		# Check whether the stream is on or not
-		try:
-			result = subprocess.run([streamScript, 'status'], stdout=subprocess.PIPE).stdout.decode('utf-8')
-		except subprocess.CalledProcessError as e:
-			result = e.output.decode('utf-8')
-		print(result)
-		
-		if 'stopped' in result:
-			streaming = 0
-			return 1
-		else:
-			streaming = 1
-			return 0
-
-	else:
-		# Turn off stream
-		subprocess.call([streamScript, 'stop'], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-		
-		streaming = 0
-		return 0
-
+#####################################################################################################################################
 
 #############################################
 # Flask Pages and Functions
@@ -302,18 +382,21 @@ def index():
 	if not initialStartup:
 		initialStartup = True
 
+		# If user has selected for the camera stream to be active by default, turn it on now
+		if autoStartCamera and not streaming:
+			cameraAutoStartValue = autoStartCamera
+			streamingValue = streaming
+			print("Auto Start Camera is set to", cameraAutoStartValue, "and Streaming value is set to", streamingValue)
+			print("Automaticaly starting camera stream")
+			onoff_streamer()
+
 		# If user has selected for the Arduino to connect by default, do so now
 		if autoStartArduino and not test_arduino():
 			onoff_arduino(workQueue, selectedPort)
 			print("Started Arduino comms")
 
-		# If user has selected for the camera stream to be active by default, turn it on now
-		if autoStartCamera and not streaming:
-			onoff_streamer()
-			print("Started camera stream")
 
 	return render_template('index.html',sounds=files,ports=usb_ports,portSelect=selectedPort,connected=arduinoActive,cameraActive=streaming)
-
 
 ##
 # Show the Login page
@@ -324,6 +407,7 @@ def login():
 		return redirect(url_for('index'))
 	else:
 		return render_template('login.html')
+
 
 ##
 # Check if the login password is correct
@@ -447,23 +531,19 @@ def settings():
 ##
 # Play an Audio clip on the Raspberry Pi
 #
+
 @app.route('/audio', methods=['POST'])
 def audio():
 	if session.get('active') != True:
 		return redirect(url_for('login'))
-
+		
 	clip =  request.form.get('clip')
 	if clip is not None:
 		clip = soundFolder + clip + ".ogg"
 		print("Play music clip:", clip)
 		pygame.mixer.music.load(clip)
-		pygame.mixer.music.set_volume(volume/10.0)
-		#start_time = time.time()
+		pygame.mixer.music.set_volume(volume/20.0) # zmiana z 10.0
 		pygame.mixer.music.play()
-		#while pygame.mixer.music.get_busy() == True:
-		#	continue
-		#elapsed_time = time.time() - start_time
-		#print(elapsed_time)
 		return jsonify({'status': 'OK' })
 	else:
 		return jsonify({'status': 'Error','msg':'Unable to read POST data'})
@@ -614,5 +694,6 @@ def arduinoStatus():
 #
 if __name__ == '__main__':
 
-	#app.run()
-	app.run(debug=False, host='0.0.0.0')
+	app.run(threaded=True, debug=False, host='0.0.0.0')
+
+# ####################################################
