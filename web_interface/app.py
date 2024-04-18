@@ -229,8 +229,10 @@ def parseArduinoMessage(dataString):
 			batteryLevel = dataList[1]
 			# ####################################################
 			# Start pulsing LED if battery level drops below 49
-			if enableLED and batteryLevel < "50":
-			    led.pulse()
+			if enableLED and (batteryLevel < "50"):
+				led.pulse()
+			else:
+			    led.value = 0.1
 			# ####################################################
 
 ##
